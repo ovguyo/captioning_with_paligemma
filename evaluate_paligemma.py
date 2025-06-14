@@ -7,6 +7,9 @@ import json
 import numpy as np
 from collections import defaultdict
 import gc
+import argparse
+import re
+
 
 from transformers import AutoTokenizer, AutoProcessor, BitsAndBytesConfig
 from transformers import PaliGemmaForConditionalGeneration
@@ -22,8 +25,7 @@ try:
 except:
     pass
 
-# Optional: Install pycocoevalcap for CIDEr if you need it
-# pip install pycocoevalcap
+
 try:
     from pycocoevalcap.cider.cider import Cider
 
@@ -32,36 +34,57 @@ except ImportError:
     print("CIDEr metric not available. Install pycocoevalcap if needed.")
     CIDER_AVAILABLE = False
 
+
+parser = argparse.ArgumentParser(description="checkpoint path.")
+parser.add_argument("checkpoint", help="The input argument")
+parser.add_argument("is_cot", help="The input argument")
+
+
+args = parser.parse_args()
+
+print(f"You passed: {args.checkpoint}")
+
 # Configuration
-CHECKPOINT_PATH = "./paligemma-decoder-only-finetuned2/best_model"
+CHECKPOINT_PATH = args.checkpoint
 BASE_MODEL_ID = "google/paligemma2-3b-mix-224"
 
 # Dataset Configuration
 CAPTION_ANNOTATIONS_FILE = '../dataset/RISCM/captions.csv'
+# CAPTION_ANNOTATIONS_FILE = '../dataset_with_steps_svo.csv'
 IMAGE_FOLDER = '../dataset/RISCM/resized'
 IMAGE_COL_NAME = 'image'
 TARGET_CAPTION_COLUMNS = ['caption_1', 'caption_2', 'caption_3', 'caption_4', 'caption_5']
+# TARGET_CAPTION_COLUMNS = ['original_caption']
 SPLIT_COL_NAME = 'split'
-TEST_SPLIT = 'test'  # or 'val' if you want to evaluate on validation set
+TEST_SPLIT = 'test'
+is_cot = args.is_cot
 
+print("Is CoT: ", is_cot)
 # Evaluation Configuration
 BATCH_SIZE = 1
-MAX_GEN_LENGTH = 12
-BASE_CAPTIONING_PROMPT_TEXT = "caption en"
+MAX_GEN_LENGTH = 40
+
+# BASE_CAPTIONING_PROMPT_TEXT =  "Describe this image with a step-by-step thought process, ending with 'Final Caption: [your caption here]'.
+# BASE_CAPTIONING_PROMPT_TEXT = "[sub: noun] [obj: noun] **[caption: sentence]**"
+
+if is_cot == True:
+    BASE_CAPTIONING_PROMPT_TEXT = """Describe [subject: noun] and [object: noun] of this image. Then, provide the image description [final caption: sentence]"""
+else:
+    BASE_CAPTIONING_PROMPT_TEXT = "caption en"
+
 OUTPUT_FILE = "evaluation_results.json"
-DETAILED_OUTPUT_FILE = "detailed_evaluation_results.json"
+DETAILED_OUTPUT_FILE = "detailed_evaluation_results_cot.json"
 LOAD_IN_4BIT = True
 SEED = 42
 
-# Generation Configuration
 GENERATION_CONFIG = {
-    "max_new_tokens": MAX_GEN_LENGTH,
+    "max_new_tokens": 40,
+    "length_penalty": -1.0,
     "do_sample": False,
-    "temperature": 1.0,
-    "top_p": 0.9,
-    "repetition_penalty": 2.2,
-    "length_penalty": 0.8,
-    "no_repeat_ngram_size": 2,
+    # "temperature": 1.0,
+    # "top_p": 0.9,
+    "repetition_penalty": 1.2,
+    "num_beams": 2
 }
 
 
@@ -69,13 +92,6 @@ def load_model_and_processor(checkpoint_path, base_model_id, load_in_4bit=True):
     """Load the fine-tuned model and processor."""
     print(f"Loading processor from {base_model_id}...")
     processor = AutoProcessor.from_pretrained(base_model_id)
-    tokenizer = AutoTokenizer.from_pretrained(base_model_id)
-
-    # Set pad token if not set
-    if processor.tokenizer.pad_token is None:
-        processor.tokenizer.pad_token = processor.tokenizer.eos_token
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
 
     # Determine device and dtype
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -102,22 +118,14 @@ def load_model_and_processor(checkpoint_path, base_model_id, load_in_4bit=True):
     model = PeftModel.from_pretrained(model, checkpoint_path)
     model.eval()
 
-    # Ensure model's pad_token_id is aligned with tokenizer after loading
-    if tokenizer.pad_token_id is not None and (
-            not hasattr(model.config, 'pad_token_id') or model.config.pad_token_id is None):
-        model.config.pad_token_id = tokenizer.pad_token_id
-    if hasattr(model.config,
-               'eos_token_id') and model.config.eos_token_id is None and tokenizer.eos_token_id is not None:
-        model.config.eos_token_id = tokenizer.eos_token_id
-
-    return model, processor, tokenizer, device, model_dtype
+    return model, processor, device, model_dtype
 
 
 def load_test_data(annotations_file, image_folder, image_col, caption_cols, split_col, target_split):
     """Load test data from CSV."""
     print(f"Loading test data from {annotations_file}...")
     df = pd.read_csv(annotations_file)
-    test_data = df[df[split_col] == target_split].reset_index(drop=True)
+    test_data = df[df[split_col] == target_split].reset_index(drop=True)[0:1000]
     print(f"Found {len(test_data)} examples for split '{target_split}'.")
 
     # Prepare data structure
@@ -143,7 +151,18 @@ def load_test_data(annotations_file, image_folder, image_col, caption_cols, spli
     return processed_data
 
 
-def generate_caption(model, processor, tokenizer, image_path, prompt, device, model_dtype, generation_config):
+
+def extract_captions(text):
+    # Pattern to match [caption: sentence] followed by the actual sentence
+    pattern = r'\[caption:\s*sentence\]\s*([^[]*?)(?=\[|$)'
+    matches = re.findall(pattern, text, re.DOTALL)
+
+    # Clean up the extracted sentences (remove extra whitespace)
+    captions = [match.strip() for match in matches if match.strip()]
+    return captions
+
+
+def generate_caption(model, processor, image_path, prompt, device, model_dtype, generation_config):
     """Generate a caption for a single image."""
     try:
         # Load and process image
@@ -178,8 +197,9 @@ def generate_caption(model, processor, tokenizer, image_path, prompt, device, mo
         # Decode the generated caption
         # Remove the input tokens to get only the generated part
         generated_tokens = outputs[0][input_ids.shape[1]:]
-        generated_caption = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+        generated_caption = processor.decode(generated_tokens, skip_special_tokens=True)
         print(generated_caption)
+        print("-----")
 
         return generated_caption.strip()
 
@@ -198,8 +218,11 @@ def calculate_bleu_scores(predictions, references):
 
     for pred, refs in zip(predictions, references):
         # Tokenize
-        pred_tokens = pred.lower().split()
-        refs_tokens = [ref.lower().split() for ref in refs]
+        try:
+            pred_tokens = pred.lower().split()
+            refs_tokens = [ref.lower().split() for ref in refs]
+        except:
+            print("Pred:", pred)
 
         # Calculate individual BLEU scores
         bleu_1 = sentence_bleu(refs_tokens, pred_tokens, weights=(1, 0, 0, 0))
@@ -286,7 +309,7 @@ def main():
             torch.cuda.manual_seed_all(SEED)
 
     # Load model and processor
-    model, processor, tokenizer, device, model_dtype = load_model_and_processor(
+    model, processor, device, model_dtype = load_model_and_processor(
         CHECKPOINT_PATH, BASE_MODEL_ID, LOAD_IN_4BIT
     )
 
@@ -304,14 +327,20 @@ def main():
     print(f"\nGenerating captions for {len(test_data)} images...")
     count = 0
     for item in tqdm(test_data, desc="Generating captions"):
-        # Generate caption
-        #if count > 15:
-            #break
         generated_caption = generate_caption(
-            model, processor, tokenizer,
+            model, processor,
             item['image_path'], BASE_CAPTIONING_PROMPT_TEXT,
             device, model_dtype, GENERATION_CONFIG
         )
+        if is_cot == True:
+            generated_caption = extract_captions(generated_caption)
+            if generated_caption:
+                if len(generated_caption)>0:
+                    generated_caption = generated_caption[0]
+            else:
+                generated_caption = ""
+
+        print(generated_caption)
 
         predictions.append(generated_caption)
         references.append(item['references'])
